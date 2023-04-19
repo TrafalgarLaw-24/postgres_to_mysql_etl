@@ -65,64 +65,65 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 # Amount of data points aggregated for every device per hour.
 # Total distance of device movement for every device per hour.
 async def aggregate_data():
-    while True:
-        # Calculate start and end time for the hourly interval
-        end_time = datetime.now().replace(microsecond=0, second=0, minute=0)
-        start_time = end_time - timedelta(hours=1)
-        print(f"Start time {start_time} and End time {end_time}")
+    with psql_engine.connect() as psql_engine_conn:
+        while True:
+            # Calculate start and end time for the hourly interval
+            end_time = datetime.now().replace(microsecond=0, second=0, minute=0)
+            start_time = end_time - timedelta(hours=1)
+            print(f"Start time {start_time} and End time {end_time}")
 
-        # Get all unique device IDs in the last hour
-        devices_query = devices.select().where(cast(devices.c.time, Integer) >= int(start_time.timestamp()))
-        device_ids = set(r['device_id'] for r in psql_engine.execute(devices_query))
+            # Get all unique device IDs in the last hour
+            devices_query = devices.select().where(cast(devices.c.time, Integer) >= int(start_time.timestamp()))
+            device_ids = set(r['device_id'] for r in psql_engine_conn.execute(devices_query))
 
-        # Aggregate data for each device
-        for device_id in device_ids:
-            # Maximum temperature
-            temp_agg = psql_engine.execute(
-                select([func.max(devices.c.temperature)]).where(
+            # Aggregate data for each device
+            for device_id in device_ids:
+                # Maximum temperature
+                temp_agg = psql_engine_conn.execute(
+                    select([func.max(devices.c.temperature)]).where(
+                        devices.c.device_id == device_id and
+                        devices.c.time >= int(start_time.timestamp()) and
+                        devices.c.time < int(end_time.timestamp())
+                    )
+                ).scalar()
+
+                # Data points
+                data_points_agg = psql_engine_conn.execute(
+                    select([func.count()]).where(
+                        devices.c.device_id == device_id and
+                        devices.c.time >= int(start_time.timestamp()) and
+                        devices.c.time < int(end_time.timestamp())
+                    )
+                ).scalar()
+
+                # Total distance
+                locations_query = devices.select().where(
                     devices.c.device_id == device_id and
                     devices.c.time >= int(start_time.timestamp()) and
                     devices.c.time < int(end_time.timestamp())
                 )
-            ).scalar()
+                locations = [json.loads(r['location']) for r in psql_engine_conn.execute(locations_query)]
+                distance = 0.0
+                for i in range(1, len(locations)):
+                    lat1, lon1 = float(locations[i-1]['latitude']), float(locations[i-1]['longitude'])
+                    lat2, lon2 = float(locations[i]['latitude']), float(locations[i]['longitude'])
+                    distance += calculate_distance(lat1, lon1, lat2, lon2)
 
-            # Data points
-            data_points_agg = psql_engine.execute(
-                select([func.count()]).where(
-                    devices.c.device_id == device_id and
-                    devices.c.time >= int(start_time.timestamp()) and
-                    devices.c.time < int(end_time.timestamp())
+                # Store aggregated data in MySQL
+                mysql_engine.execute(
+                    aggregated_results.insert().values(
+                        device_id=device_id,
+                        max_temperature=temp_agg,
+                        data_point_count=data_points_agg,
+                        total_distance=distance,
+                        time=start_time  # Converting EPoch time to datetime type for MySQL
+                    )
                 )
-            ).scalar()
+            print(f"Aggregated data between Start time {start_time} and End time {end_time} ingested successfully")
 
-            # Total distance
-            locations_query = devices.select().where(
-                devices.c.device_id == device_id and
-                devices.c.time >= int(start_time.timestamp()) and
-                devices.c.time < int(end_time.timestamp())
-            )
-            locations = [json.loads(r['location']) for r in psql_engine.execute(locations_query)]
-            distance = 0.0
-            for i in range(1, len(locations)):
-                lat1, lon1 = float(locations[i-1]['latitude']), float(locations[i-1]['longitude'])
-                lat2, lon2 = float(locations[i]['latitude']), float(locations[i]['longitude'])
-                distance += calculate_distance(lat1, lon1, lat2, lon2)
-
-            # Store aggregated data in MySQL
-            mysql_engine.execute(
-                aggregated_results.insert().values(
-                    device_id=device_id,
-                    max_temperature=temp_agg,
-                    data_point_count=data_points_agg,
-                    total_distance=distance,
-                    time=start_time  # Converting EPoch time to datetime type for MySQL
-                )
-            )
-        print(f"Aggregated data between Start time {start_time} and End time {end_time} ingested successfully")
-
-        # Wait for an hour to perform the next aggregation
-        print("Waiting for one hour to get data accumulated")
-        await asyncio.sleep(3600)
+            # Wait for an hour to perform the next aggregation
+            print("Waiting for one hour to get data accumulated")
+            await asyncio.sleep(3600)
 
 
 loop = asyncio.get_event_loop()
